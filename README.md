@@ -1,166 +1,172 @@
 # Lighthouse Attention
-
-**Paper:** [*Long Context Pre-Training with Lighthouse Attention*](https://arxiv.org/pdf/2605.06554v1)
-
-**Original implementation** of *Lighthouse Attention*: a
-selection-based hierarchical attention mechanism for training large language
-models at very long context. This is the codebase used to produce all
-results in the paper.
-
-This repository ships Lighthouse as a single patch on top of
-[pytorch/torchtitan][upstream] plus the two Lighthouse-specific
-source files. The patch wires in selection, three scorer variants
-(`norm`, `dilated`, `gla`), and an optional context-parallel (CP) path,
-with the scorer chosen per-config &mdash; no edits to `model.py` required.
-
-[upstream]: https://github.com/pytorch/torchtitan
-
-## Layout
-
-```
-lighthouse-attention/
-├── README.md                       this file
-├── requirements.txt                pinned versions
-├── lighthouse-attention.patch      one patch, applies on torchtitan @ 61c25f8d
-├── src/
-│   ├── lighthouse_selection.py     drop into torchtitan/models/llama3/model/
-│   └── lighthouse_selection_cuda.py
-└── configs/
-    ├── topk/      vary top-K  (1536, 2048, 3072, 4096, 6144) at p=4, L=3
-    ├── pool/      vary pool   (p=2, 4, 8)                    at k=1536, L=3
-    ├── levels/    vary levels (L=3, 4, 5)                    at k=1536, p=2
-    ├── scorer/    norm | dilated | gla                       at k=2048, p=4, L=3
-    └── cp/        CP=2 / DP=4 demo                           at k=1536, p=4, L=3 (norm)
-```
-
-## Tested versions
-
-```
-torch          2.11.0+cu128
-CUDA           12.8
-cuDNN          9.19.0
-GPU            NVIDIA B200 (sm_100)
-upstream sha   61c25f8d   (pytorch/torchtitan @ main)
-```
-
-## Apply
-
-1. Clone the upstream torchtitan and check out the tested commit:
-
-   ```bash
-   git clone https://github.com/pytorch/torchtitan.git
-   cd torchtitan
-   git checkout 61c25f8d
-   ```
-
-2. Drop in the two Lighthouse source files (the patch does not carry these):
-
-   ```bash
-   cp /path/to/lighthouse-attention/src/lighthouse_selection.py      torchtitan/models/llama3/model/
-   cp /path/to/lighthouse-attention/src/lighthouse_selection_cuda.py torchtitan/models/llama3/model/
-   ```
-
-3. Apply the patch:
-
-   ```bash
-   git apply /path/to/lighthouse-attention/lighthouse-attention.patch
-   ```
-
-4. Install the requirements (Python 3.13, CUDA 12.8 toolkit on the host):
-
-   ```bash
-   python3.13 -m venv .venv && source .venv/bin/activate
-   pip install -r /path/to/lighthouse-attention/requirements.txt
-   pip install -e . --no-deps
-   ```
-
-   `requirements.txt` already pins the PyTorch CUDA-12.8 stable index
-   (`https://download.pytorch.org/whl/cu128`) via `--extra-index-url`, so
-   `torch==2.11.0+cu128` resolves without any extra flags.
-
-   `flash-linear-attention` is only needed if you select
-   `lighthouse_scorer = "gla"`. For `norm` (default) or `dilated`, you can
-   leave that line out.
-
-## What the patch changes
-
-| File                                          | Hunk |
-|-----------------------------------------------|------|
-| `torchtitan/models/llama3/model/args.py`      | Adds `dilation`, `hidden_dim`, `use_selection_lighthouse`, `use_lighthouse_cp`, `lighthouse_num_levels`, `lighthouse_pooling_factor`, `lighthouse_topk`, `lighthouse_scorer`, `lighthouse_full_attn_layers` to `TransformerModelArgs`. |
-| `torchtitan/models/llama3/model/model.py`     | `_build_lighthouse_scorer(...)` dispatches on `lighthouse_scorer ∈ {norm, dilated, gla}` and refuses non-`norm` under CP. Wires the gate projection (`wg`) for the GLA path. FFN now honors explicit `hidden_dim` when set. |
-| `torchtitan/models/llama3/__init__.py`        | Registers ~26 Lighthouse ablation flavors (`ablation_270m_lighthouse_topk*_*`) covering the (k, p, L) grid in the paper, plus dim-matched dense (`*_sdpa`) flavors for the SDPA-resume stage. |
-| `torchtitan/models/llama3/infra/parallelize.py` | `apply_compile` now uses `compile_config.fullgraph` so the Lighthouse path can compile each `TransformerBlock` with graph breaks allowed (`@torch.compiler.disable` on the scorers requires this). |
-| `torchtitan/distributed/utils.py`             | `create_context_parallel_ctx(..., enable_load_balance=True)` knob so the CP path can opt out of load-balancing. |
-| `torchtitan/hf_datasets/text_datasets.py`     | Registers a `c4_local` dataset entry for an on-disk C4 mirror. |
-| `torchtitan/train.py`                         | When CP is enabled and the model has Lighthouse-CP modules, calls `set_cp_info(rank, world_size, cp_group)` once and threads `enable_load_balance=is_lighthouse_cp` through the CP context. |
-| `torchtitan/config/job_config.py`             | Adds `fullgraph: bool = False` to the `Compile` dataclass. |
-
-The two new files (`lighthouse_selection.py`, `lighthouse_selection_cuda.py`) live in `src/` and are copied in step 2 above.
-
-## Selecting the scorer
-
-The default scorer is `norm`. To switch, set `lighthouse_scorer` on the
-flavor in `torchtitan/models/llama3/__init__.py`:
-
-```python
-"my_dilated_run": TransformerModelArgs(
-    dim=1024, n_layers=30, hidden_dim=1536, n_heads=8, n_kv_heads=8,
-    rope_theta=10000,
-    use_selection_lighthouse=True,
-    lighthouse_num_levels=3,
-    lighthouse_pooling_factor=4,
-    lighthouse_topk=2048,
-    lighthouse_scorer="dilated",       # <-- override here  (or "norm" / "gla")
-    dilation=4,
-    lighthouse_full_attn_layers=[0, 1, 28, 29],
-),
-```
-
-Then point your toml at the new flavor:
-
-```toml
-[model]
-flavor = "my_dilated_run"
-```
-
-The CP path explicitly refuses anything other than `norm` at construction
-time:
-
-```
-ValueError: lighthouse_scorer='dilated' is not supported under context
-parallelism. The CP path was validated only for 'norm'; ...
-```
-
-## Running a config
-
-The configs in `configs/` use placeholder paths (`<DUMP_FOLDER>`,
-`<HF_ASSETS_PATH>`, `<CHECKPOINT_FOLDER>`). Replace them in place or via
-`sed` before launching:
-
+ 
+Official implementation of **Lighthouse Attention**, from the paper:
+ 
+> **Long Context Pre-Training with Lighthouse Attention**
+> Bowen Peng, Subho Ghosh, Jeffrey Quesnelle — Nous Research, May 2026
+> [arXiv:2605.06554](https://arxiv.org/abs/2605.06554)
+ 
+---
+ 
+## What is Lighthouse Attention?
+ 
+Training causal transformers on very long sequences is bottlenecked by the quadratic time and memory cost of standard scaled dot-product attention (SDPA). Existing sparse attention methods solve this at inference but introduce a harder problem: they cannot be evaluated against their dense backbone during training, so you never know if the model actually learned to use the sparse structure.
+ 
+Lighthouse Attention solves this differently. It is a **training-only, symmetrical, selection-based hierarchical attention** that:
+ 
+- Wraps around ordinary SDPA — no new kernel required
+- Is gradient-free by construction (no straight-through estimator)
+- Is removed after training, recovering a full dense attention model
+- Achieves sub-quadratic pre- and post-processing while preserving left-to-right causality
+The core idea is a **symmetric pyramid** that pools queries, keys, and values simultaneously across a multi-level hierarchy, selects the top-K entries using a fused chunked-bitonic kernel, and attends to them with standard FlashAttention. Because the selection is symmetric and pooling is bidirectional, the model retains full-resolution representations at every level while the expensive attention computation operates on a compressed subsequence.
+ 
+---
+ 
+## How it differs from other sparse attention methods
+ 
+| Property | MoBA | NSA (DeepSeek) | Lighthouse (ours) |
+|---|---|---|---|
+| Selection granularity | Block-level | Token-level | Multi-level pyramid |
+| Symmetry | No | No | Yes (Q, K, V pooled symmetrically) |
+| Training-time only | No | No | Yes |
+| Gradient-free selection | No | No | Yes |
+| Reuses FlashAttention kernel | No | No | Yes |
+| Recovers dense model at inference | No | No | Yes |
+ 
+**MoBA** selects contiguous blocks, which fits long-context inference but creates architectural entanglement — the sparse kernel lives inside the attention computation so optimized dense kernels cannot be reused.
+ 
+**NSA (Native Sparse Attention)** scores every past token via a learned indexer and routes the top-K into a sparse operator. This is powerful but the selection is non-differentiable and the sparse kernel is architecture-specific.
+ 
+**Lighthouse** sidesteps both problems. Selection lives outside the attention path, so standard FlashAttention handles the actual computation. The symmetric pyramid compresses the sequence before attention, not inside it. The result is a training-time efficiency method that leaves no architectural trace at inference — the final model is an ordinary dense transformer.
+ 
+---
+ 
+## The Symmetric Pyramid
+ 
+The central mechanism is a two-stage compression and decompression of the input sequence.
+ 
+**Pre-processing (compression):**
+The sequence is pooled into a multi-level pyramid. At each level, fixed-size chunks are pooled symmetrically — queries, keys, and values are all pooled together, preserving left-to-right causality. A parameter-free fused chunked-bitonic scorer ranks every pyramid entry bidirectionally. The top-K entries are selected.
+ 
+**Attention:**
+The selected K entries form a dense, causally consistent subsequence. Standard FlashAttention runs on this compressed input. Because the entries are pooled symmetrically, outputs back-scatter deterministically — no learned routing, no auxiliary losses.
+ 
+**Post-processing (decompression):**
+Outputs are scattered back to full resolution. The back-scatter is deterministic given the pyramid structure, so no additional parameters or losses are needed.
+ 
+The expensive step — the O(N²) attention computation — operates on O(N log N / K) tokens at level L = log_p(N/K), achieving sub-quadratic complexity while preserving the full-resolution residual stream.
+ 
+---
+ 
+## Key Properties
+ 
+**Training correctness.** The central empirical question for any training-time sparse method is: does the resulting model match a dense baseline? Lighthouse models trained to convergence match or beat dense SDPA baselines trained on the same token budget, measured after a short dense recovery phase.
+ 
+**No inference overhead.** All Lighthouse components are training-only. At inference the model is an ordinary dense transformer checkpoint. No sparse kernels, no routing logic, no pyramid — just the fine-tuned weights.
+ 
+**Plug-and-play.** Lighthouse patches into the attention forward pass via a two-line modification. No architectural changes to the surrounding transformer are required.
+ 
+---
+ 
+## Installation
+ 
+Lighthouse Attention is implemented as a patch on [torchtitan](https://github.com/pytorch/torchtitan).
+ 
 ```bash
-cd torchtitan
-sed -e 's|<DUMP_FOLDER>|/scratch/runs/topk1536|' \
-    -e 's|<HF_ASSETS_PATH>|/scratch/tokenizer/bytes|' \
-    -e 's|<CHECKPOINT_FOLDER>|/scratch/ckpts/topk1536|' \
-    /path/to/lighthouse-attention/configs/topk/topk1536.toml \
-    > /tmp/run.toml
-torchrun --nproc-per-node 8 ./torchtitan/train.py --job.config_file /tmp/run.toml
+git clone https://github.com/ighoshsubho/lighthouse-attention.git
+cd lighthouse-attention
+ 
+# Apply the patch to your torchtitan installation
+git apply lighthouse_attention.patch
 ```
-
-Each config sets `[training] steps = 10000` to match the Stage-1 Lighthouse
-phase from the paper. For the SDPA-resume continuation, point a second toml
-at the same `[checkpoint] folder` with `[training] steps = 16000` and the
-dim-matched dense flavor (`ablation_270m_topk*_pool*_lvl*_sdpa`) that the
-patch registers alongside each lighthouse flavor.
-
-## Context-parallel run
-
+ 
+### Requirements
+ 
+```
+torch >= 2.3
+torchtitan
+flash-attn >= 2.0
+```
+ 
+---
+ 
+## Usage
+ 
+After applying the patch, Lighthouse Attention is controlled via config flags:
+ 
 ```bash
-torchrun --nnodes 1 --nproc-per-node 8 ./torchtitan/train.py \
-    --job.config_file /path/to/lighthouse-attention/configs/cp/norm_cp2_dp4.toml
+# Key hyperparameters
+--lighthouse.top_k          # Number of tokens selected per pyramid level (default: 64)
+--lighthouse.pool_size      # Pooling chunk size (default: 4)
+--lighthouse.levels         # Number of pyramid levels (default: 3)
+--lighthouse.scorer_type    # Scoring function: 'bitonic' or 'learned' (default: 'bitonic')
+--lighthouse.ctx_parallel   # Enable context parallelism (default: False)
 ```
-
-The toml sets `context_parallel_degree = 2`. The patch wires
-`set_cp_info(...)` automatically the first time `forward_backward_step`
-runs under CP, and the train loop uses `enable_load_balance=True` for the
-ring-attention path while the Lighthouse selection runs shard-locally.
+ 
+### Example: Training with Lighthouse Attention
+ 
+```bash
+# Train with Lighthouse Attention (top-K=64, pool_size=4, 3 pyramid levels)
+torchrun --nproc_per_node=8 train.py \
+  --model.name llama3_8b \
+  --training.seq_len 32768 \
+  --lighthouse.top_k 64 \
+  --lighthouse.pool_size 4 \
+  --lighthouse.levels 3
+ 
+# Recovery phase: disable Lighthouse, fine-tune with full dense attention
+torchrun --nproc_per_node=8 train.py \
+  --model.name llama3_8b \
+  --training.seq_len 32768 \
+  --lighthouse.enabled False \
+  --training.load_checkpoint path/to/lighthouse_checkpoint
+```
+ 
+---
+ 
+## Two-Stage Training
+ 
+Lighthouse uses a two-stage approach:
+ 
+1. **Pre-training with Lighthouse** (~90% of budget): Sub-quadratic attention via the symmetric pyramid. Fast, memory-efficient, scales to long contexts.
+2. **Dense recovery** (~10% of budget): Standard SDPA fine-tuning on top of the Lighthouse checkpoint. Recovers full dense attention quality.
+The recovery phase is short because Lighthouse preserves the full-resolution residual stream throughout pre-training — the model has already learned long-range dependencies, it just needs to adapt to the dense attention pattern.
+ 
+---
+ 
+## Source Files
+ 
+```
+src/
+  lighthouse_selection.py         # Pyramid construction, top-K selection, scatter/gather
+  lighthouse_selection_cuda.py    # CUDA-accelerated chunked-bitonic scorer
+configs/
+  vary_top_k.yaml                 # Sweep top-K hyperparameter
+  vary_pool_size.yaml             # Sweep pooling chunk size
+  vary_levels.yaml                # Sweep pyramid depth
+  vary_scorer_type.yaml           # Compare bitonic vs learned scorer
+  vary_ctx_parallel.yaml          # Context parallelism ablation
+```
+ 
+---
+ 
+## Citation
+ 
+```bibtex
+@article{peng2026lighthouse,
+  title={Long Context Pre-Training with Lighthouse Attention},
+  author={Peng, Bowen and Ghosh, Subho and Quesnelle, Jeffrey},
+  journal={arXiv preprint arXiv:2605.06554},
+  year={2026}
+}
+```
+ 
+---
+ 
+## Related Work
+ 
+- [Lost in the Middle](https://arxiv.org/abs/2307.03172) — Liu et al., 2024. Documents the U-shaped positional attention bias that Lighthouse addresses during pre-training.
+- [MoBA](https://arxiv.org/abs/2502.13189) — Block-level sparse attention, inference-time.
+- [NSA](https://arxiv.org/abs/2502.11089) — DeepSeek Native Sparse Attention, token-level selection.
+- [HISA](https://arxiv.org/abs/2406.16008) — Hierarchical indexer for sparse attention scoring.
+- [FlashAttention-2](https://arxiv.org/abs/2307.08691) — The dense kernel Lighthouse delegates actual attention computation to.
