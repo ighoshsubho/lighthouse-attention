@@ -1,7 +1,5 @@
 # Lighthouse Attention
 
-**Paper:** [*Long Context Pre-Training with Lighthouse Attention*](https://arxiv.org/pdf/2605.06554v1)
-
 **Original implementation** of *Lighthouse Attention*: a
 selection-based hierarchical attention mechanism for training large language
 models at very long context. This is the codebase used to produce all
