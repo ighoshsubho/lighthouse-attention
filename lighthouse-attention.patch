@@ -41,7 +41,7 @@ index f424276a..893b110d 100644
      return context_parallel(
          cp_mesh,
 diff --git a/torchtitan/hf_datasets/text_datasets.py b/torchtitan/hf_datasets/text_datasets.py
-index 493cd1ab..fdb37af1 100644
+index 493cd1ab..bc4c532a 100644
 --- a/torchtitan/hf_datasets/text_datasets.py
 +++ b/torchtitan/hf_datasets/text_datasets.py
 @@ -38,6 +38,11 @@ DATASETS = {
@@ -581,7 +581,7 @@ index d83fb831..00b8b1fe 100644
          seq_len = job_config.training.seq_len
          if seq_len > self.max_seq_len:
 diff --git a/torchtitan/models/llama3/model/model.py b/torchtitan/models/llama3/model/model.py
-index 124153f1..343e2506 100644
+index 124153f1..8bcd716d 100644
 --- a/torchtitan/models/llama3/model/model.py
 +++ b/torchtitan/models/llama3/model/model.py
 @@ -21,6 +21,54 @@ from torchtitan.models.attention import (
@@ -639,7 +639,7 @@ index 124153f1..343e2506 100644
  from torchtitan.protocols.model import AttentionMasksType
  from torchtitan.protocols.train_spec import ModelProtocol
  
-@@ -197,10 +245,57 @@ class Attention(nn.Module):
+@@ -197,10 +245,61 @@ class Attention(nn.Module):
          else:
              self.inner_attention = ScaledDotProductAttentionWrapper()
  
@@ -670,6 +670,8 @@ index 124153f1..343e2506 100644
 +                num_levels=self.num_levels,
 +                pooling_factor=self.pooling_factor,
 +                topk=self.topk,
++                head_dim=self.head_dim,
++                rope_theta=model_args.rope_theta,
 +            )
 +        else:
 +            self.selection_attn = LLocal(
@@ -678,6 +680,8 @@ index 124153f1..343e2506 100644
 +                pooling_factor=self.pooling_factor,
 +                topk=self.topk,
 +                attention=self.inner_attention,
++                head_dim=self.head_dim,
++                rope_theta=model_args.rope_theta,
 +            )
 +
      def init_weights(self, init_std: float):
@@ -697,20 +701,32 @@ index 124153f1..343e2506 100644
  
      def forward(
          self,
-@@ -236,20 +331,27 @@ class Attention(nn.Module):
-         keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
-         values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+@@ -230,26 +329,35 @@ class Attention(nn.Module):
+         xk = xk.view(bs, seqlen, -1, self.head_dim)
+         xv = xv.view(bs, seqlen, -1, self.head_dim)
  
--        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
--        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
--        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+-        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
 +        if self.use_selection_lighthouse and self._use_lighthouse:
++            # RoPE is applied inside selection (per selected token, at its pooled
++            # position); the lighthouse path must receive RAW, un-rotated q/k.
 +            if self._needs_gate:
 +                gk = F.logsigmoid(self.wg(x)) / self.gate_logit_normalizer
 +                output = self.selection_attn(xq, xk, xv, gk=gk)
 +            else:
 +                output = self.selection_attn(xq, xk, xv)
 +        else:
++            xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+ 
+-        # repeat k/v heads if n_kv_heads < n_heads
+-        keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+-        values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
++            # repeat k/v heads if n_kv_heads < n_heads
++            keys = repeat_kv(xk, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
++            values = repeat_kv(xv, self.n_rep)  # (bs, seqlen, n_local_heads, head_dim)
+ 
+-        xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+-        xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
+-        xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 +            xq = xq.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 +            xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 +            xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
@@ -737,7 +753,7 @@ index 124153f1..343e2506 100644
  
          output = output.transpose(
              1, 2
-@@ -327,9 +429,12 @@ class TransformerBlock(nn.Module):
+@@ -327,9 +435,12 @@ class TransformerBlock(nn.Module):
          self.n_heads = model_args.n_heads
          self.dim = model_args.dim
          self.attention = Attention(model_args)
@@ -751,7 +767,7 @@ index 124153f1..343e2506 100644
              multiple_of=model_args.multiple_of,
              ffn_dim_multiplier=model_args.ffn_dim_multiplier,
          )
-@@ -403,6 +508,15 @@ class Transformer(nn.Module, ModelProtocol):
+@@ -403,6 +514,15 @@ class Transformer(nn.Module, ModelProtocol):
          self.layers = torch.nn.ModuleDict()
          for layer_id in range(model_args.n_layers):
              self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
