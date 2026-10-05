@@ -769,6 +769,35 @@ def scatter_to_base_sequence(
         N_shard, N_total, num_levels, pooling_factor,
     )
 
+def pyramid_last_positions(seqlen: int, num_levels: int, pf: int, device) -> torch.Tensor:
+    parts = []
+    for level in range(num_levels):
+        cov = pf ** level
+        nlv = seqlen // cov
+        j = torch.arange(nlv, device=device, dtype=torch.long)
+        parts.append((j + 1) * cov - 1)
+    return torch.cat(parts)
+
+
+def apply_rope_at(x: torch.Tensor, pos: torch.Tensor, theta: float) -> torch.Tensor:
+    b, h, n, d = x.shape
+    inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device, dtype=torch.float32) / d))
+    ang = pos.unsqueeze(-1).float() * inv_freq
+    fc = torch.polar(torch.ones_like(ang), ang)
+    xc = torch.view_as_complex(x.float().reshape(b, h, n, d // 2, 2))
+    return torch.view_as_real(xc * fc).reshape(b, h, n, d).type_as(x)
+
+
+_ASSERT_ROPE_MONOTONIC = os.environ.get("LIGHTHOUSE_ASSERT_ROPE_MONOTONIC", "0") == "1"
+
+
+def _assert_rope_monotonic(rope_pos: torch.Tensor, tag: str = "") -> None:
+    if not _ASSERT_ROPE_MONOTONIC:
+        return
+    if not bool((rope_pos.diff(dim=-1) >= 0).all()):
+        raise AssertionError(f"rope_pos not non-decreasing after gather ({tag})")
+
+
 class LighthouseLocal(nn.Module):
     def __init__(
         self,
@@ -777,14 +806,26 @@ class LighthouseLocal(nn.Module):
         num_levels: int = 3,
         pooling_factor: int = 4,
         topk: int = 1024,
+        head_dim: int = 128,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         self.scorer = scorer
         self.num_levels = num_levels
         self.pooling_factor = pooling_factor
         self.topk = topk
+        self.head_dim = head_dim
+        self.rope_theta = rope_theta
+        self._pos_table = None
+        self._pos_len = None
 
         self.attention = attention
+
+    def _pos_table_for(self, seqlen, device):
+        if self._pos_table is None or self._pos_len != seqlen:
+            self._pos_table = pyramid_last_positions(seqlen, self.num_levels, self.pooling_factor, device)
+            self._pos_len = seqlen
+        return self._pos_table
 
     def forward(self, xq, xk, xv):
         _, s, _, d = xq.shape
@@ -796,6 +837,9 @@ class LighthouseLocal(nn.Module):
                 scores_qk_cat.to(torch.float32), scores_kq_cat.to(torch.float32),
                 self.num_levels, self.pooling_factor, self.topk, s,
             )
+
+        rope_pos = self._pos_table_for(s, xq.device)[indices]
+        _assert_rope_monotonic(rope_pos, "local")
 
         selected_xq = torch.gather(
             xq_cat, dim=2,
@@ -811,6 +855,9 @@ class LighthouseLocal(nn.Module):
             xv_cat, dim=2,
             index=indices.unsqueeze(-1).expand(-1, -1, -1, d),
         )
+
+        selected_xq = apply_rope_at(selected_xq, rope_pos, self.rope_theta)
+        selected_xk = apply_rope_at(selected_xk, rope_pos, self.rope_theta)
 
         attn_out = self.attention(selected_xq, selected_xk, selected_xv)
 
@@ -990,21 +1037,33 @@ class LighthouseCP(nn.Module):
         num_levels: int = 3,
         pooling_factor: int = 4,
         topk: int = 1024,
+        head_dim: int = 128,
+        rope_theta: float = 10000.0,
     ):
         super().__init__()
         self.scorer = scorer
         self.num_levels = num_levels
         self.pooling_factor = pooling_factor
         self.topk = topk
+        self.head_dim = head_dim
+        self.rope_theta = rope_theta
         self.attention = attention
         self._rank = 0
         self._world_size = 1
         self._cp_group = None
+        self._pos_table = None
+        self._pos_len = None
 
     def set_cp_info(self, rank: int, world_size: int, cp_group):
         self._rank = rank
         self._world_size = world_size
         self._cp_group = cp_group
+
+    def _pos_table_for(self, seqlen, device):
+        if self._pos_table is None or self._pos_len != seqlen:
+            self._pos_table = pyramid_last_positions(seqlen, self.num_levels, self.pooling_factor, device)
+            self._pos_len = seqlen
+        return self._pos_table
 
     def forward(self, xq, xk, xv):
         _, s, _, d = xq.shape
@@ -1028,13 +1087,20 @@ class LighthouseCP(nn.Module):
               self.num_levels, self.pooling_factor, topk_per_load, half,
           )
 
+        pos_table = self._pos_table_for(half, xq.device)
+        W, r = self._world_size, self._rank
+        rope_h = pos_table[indices_h] + r * half
+        rope_t = pos_table[indices_t] + (2 * W - 1 - r) * half
+        _assert_rope_monotonic(rope_h, "cp-head")
+        _assert_rope_monotonic(rope_t, "cp-tail")
+
         sel_xq = torch.cat([
-            torch.gather(xq_h, 2, indices_h.unsqueeze(-1).expand(-1,-1,-1,d)),
-            torch.gather(xq_t, 2, indices_t.unsqueeze(-1).expand(-1,-1,-1,d)),
+            apply_rope_at(torch.gather(xq_h, 2, indices_h.unsqueeze(-1).expand(-1,-1,-1,d)), rope_h, self.rope_theta),
+            apply_rope_at(torch.gather(xq_t, 2, indices_t.unsqueeze(-1).expand(-1,-1,-1,d)), rope_t, self.rope_theta),
         ], dim=2)
         sel_xk = torch.cat([
-            torch.gather(xk_h, 2, indices_h.unsqueeze(-1).expand(-1,-1,-1,d)),
-            torch.gather(xk_t, 2, indices_t.unsqueeze(-1).expand(-1,-1,-1,d)),
+            apply_rope_at(torch.gather(xk_h, 2, indices_h.unsqueeze(-1).expand(-1,-1,-1,d)), rope_h, self.rope_theta),
+            apply_rope_at(torch.gather(xk_t, 2, indices_t.unsqueeze(-1).expand(-1,-1,-1,d)), rope_t, self.rope_theta),
         ], dim=2)
         sel_xv = torch.cat([
             torch.gather(xv_h, 2, indices_h.unsqueeze(-1).expand(-1,-1,-1,d)),
